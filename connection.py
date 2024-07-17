@@ -41,7 +41,7 @@ def read_from_serial(q, stop_event, ser):
     stop_event.set()
     break
 
-def process_data(q, stop_event, configs, dataset_name, directory_path, live_data_queue):
+def process_data(q, stop_event, configs, dataset_name, directory_path, live_data_queue, live_timestamp_queue, sequence):
   items = []
   frames = []
   current_frame = []
@@ -50,6 +50,7 @@ def process_data(q, stop_event, configs, dataset_name, directory_path, live_data
   frame_count = 0
   file_output = ['18'],
   the_first = [],
+  curr_sequence = -1
   file_num = 0
   while not stop_event.is_set() or not q.empty():
     try:
@@ -94,14 +95,10 @@ def process_data(q, stop_event, configs, dataset_name, directory_path, live_data
                   if len(byte_chunk) == 4:
                     float_number = struct.unpack('>f', bytes(byte_chunk))[0]
                     floats.append(float_number)
-                live_data_queue[0].put(floats[0])
-                live_data_queue[1].put(floats[2])
-                live_data_queue[2].put(floats[4])
-                live_data_queue[3].put(floats[6])
-                live_data_queue[4].put(floats[8])
-                live_data_queue[5].put(floats[10])
-                live_data_queue[6].put(floats[12])
-                live_data_queue[7].put(floats[14])
+                curr_sequence = (curr_sequence + 1) % len(sequence)
+                for index in range(len(live_data_queue[0])):
+                  live_data_queue[0][index].put(floats[index * 2])
+                live_timestamp_queue[0].put(time.time())
                 file_output += [' '.join(map(str, floats))]
             else:
               if current_frame[2] == 1:
@@ -114,6 +111,10 @@ def process_data(q, stop_event, configs, dataset_name, directory_path, live_data
                   if len(byte_chunk) == 4:
                     float_number = struct.unpack('>f', bytes(byte_chunk))[0]
                     floats.append(float_number)
+                curr_sequence = (curr_sequence + 1) % len(sequence)
+                for index in range(len(live_data_queue[0])):
+                  live_data_queue[curr_sequence][index].put(floats[index * 2])
+                live_timestamp_queue[curr_sequence].put(time.time())
                 file_output += [' '.join(map(str, floats))]
             frame_started = False
     except Empty:
@@ -138,44 +139,73 @@ def StartStopMeasurement(q, stop_event) -> list:
     ser.write(bytearray([0xB4, 0x01, 0x00, 0xB4]))
     return measurement_data_hex
 
-def measurment(dataset_name, directory_path, live_data_queue):
-  configs = get_measurement_setup()
+def measurment(dataset_name, directory_path, live_data_queue, live_timestamp_queue, configs):
+  # configs = get_measurement_setup()
+  # for i in range(len(configs[-1])):
+  #   live_data_queue.append([Queue() for j in range(8)])
+  #   live_timestamp_queue.append(Queue())
   q = Queue()
   stop_event = Event()
   read_process = Process(target=StartStopMeasurement, args=(q, stop_event))
-  process_process = Process(target=process_data, args=(q, stop_event, configs, dataset_name, directory_path, live_data_queue))
+  process_process = Process(target=process_data, args=(q, stop_event, configs[:-2], dataset_name, directory_path, live_data_queue, live_timestamp_queue, configs[-1]))
   read_process.start()
   process_process.start()
   
-def update_graph(frame, x_data, y_data, live_data_queue, lines):
-    y = [0 for _ in range(8)]
+def update_graph(frame, x_data, y_data, live_data_queue, lines, live_timestamp_queue):
     try:
-        for i in range(len(y)):
-           y[i] = live_data_queue[i].get_nowait()
-
-        x_data.append(time.time())
-        for i in range(len(y)):
-           y_data[i].append(y[i])
-
-        for i, line in enumerate(lines):
-            line.set_data(x_data, y_data[i])
-            ax = line.axes
-            ax.set_xlim(x_data[0], x_data[-1])
-            ax.set_ylim(min(y_data[i]), max(y_data[i]))
+      while True:
+        for i in range(len(y_data)):
+          y_data[i].append(live_data_queue[i].get_nowait())
+        x_data.append(live_timestamp_queue.get_nowait())
     except Empty:
-        pass
+      pass
+
+    if x_data:
+      for i, line in enumerate(lines):
+        line.set_data(x_data, y_data[i])
+        ax = line.axes
+        ax.set_xlim(x_data[0], x_data[-1])
+        ax.set_ylim(min(y_data[i]), max(y_data[i]))
     return lines
+
+def measure():
+  configs = get_measurement_setup()
+  print(configs[-1])
+  live_data_queue = [[Queue() for i in range(8)] for j in range(len(configs[-1]))]
+  live_timestamp_queue = [Queue() for i in range(len(configs[-1]))]
+  measurment('hello', '//chips.eng.utah.edu/home/u1462232/.win_desktop/Sciospec-EIT32-Interface/test_output', live_data_queue, live_timestamp_queue, configs)
+  figs, axes, lines, anis = [], [], [], []
+  for i in range(len(configs[-1])):
+    fig, ax = plt.subplots(8,1, sharex=True)
+    figs.append(fig)
+    axes.append(ax)
+    
+    x_data, y_data = [], [[] for _ in range(8)]
+    line = [a.plot([], [])[0] for a in ax]
+    lines.append(line)
+
+    ani = animation.FuncAnimation(fig, update_graph, fargs=(x_data, y_data, live_data_queue[i], line, live_timestamp_queue[i]), interval=1000)
+    anis.append(ani)
+  plt.show()
+
 
 if __name__ == '__main__':
   set_measurement_setup(params)
   set_output_config(configurations)
-  live_data_queue = [Queue() for i in range(8)]
-  measurment('hello', '//chips.eng.utah.edu/home/u1462232/.win_desktop/Sciospec-EIT32-Interface/test_output', live_data_queue)
-  fig, axes = plt.subplots(8, 1, sharex=True)
-  x_data, y_data = [], [[] for _ in range(8)]
-  lines = [ax.plot([], [])[0] for ax in axes]
-  titles = ["Electrode 1", "Electrode 2", "Electrode 3", "Electrode 4", "Electrode 5", "Electrode 6", "Electrode 7", "Electrode 8"]
-  for ax, title in zip(axes, titles):
-    ax.set_title(title)
-  ani = animation.FuncAnimation(fig, update_graph, fargs=(x_data, y_data, live_data_queue, lines), interval=100)
-  plt.show()
+  measure()
+  # live_data_queue = [[Queue() for i in range(8)] for j in range(1)]
+  # live_timestamp_queue = [Queue()]
+  # measurment('hello', '//chips.eng.utah.edu/home/u1462232/.win_desktop/Sciospec-EIT32-Interface/test_output', live_data_queue, live_timestamp_queue)
+  # figs, axes, lines, anis = [], [], [], []
+  # for i in range(2):
+  #   fig, ax = plt.subplots(8,1, sharex=True)
+  #   figs.append(fig)
+  #   axes.append(ax)
+    
+  #   x_data, y_data = [], [[] for _ in range(8)]
+  #   line = [a.plot([], [])[0] for a in ax]
+  #   lines.append(line)
+
+  #   ani = animation.FuncAnimation(fig, update_graph, fargs=(x_data, y_data, live_data_queue[i], line, live_timestamp_queue), interval=1000)
+  #   anis.append(ani)
+  # plt.show()
